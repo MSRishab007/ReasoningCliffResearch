@@ -1,71 +1,78 @@
-# Hindi Math Reasoning with Qwen3-1.7B
+# Hindi Math Reasoning with Qwen3-4B (BF16, GPU-only)
 
-Inference-time reasoning experiments on the Hindi configuration of Sarvam AI's GSM8K-Indic dataset.
+Inference-time reasoning experiments on Sarvam AI's Hindi GSM8K dataset.
 
-## Dataset
+## Experimental setup
 
-- Hugging Face dataset: `sarvamai/gsm8k-indic`
-- Configuration: `hi`
-- Split: `test` (1,319 rows)
-- Hindi question column: `question`
-- Hindi reference-solution column: `answer`
-- Original-language columns: `original_question`, `original_answer`
-- Sample size: 200 (default)
-- Sampling seed: 42 (default)
+- Model: `Qwen/Qwen3-4B`
+- Precision: BF16 (`torch.bfloat16`)
+- Device: CUDA GPU only; CPU fallback and automatic CPU offload are disabled.
+- Expected hardware: 16-GB-class GPU with native BF16 support and at least 9 GiB free VRAM before loading.
+- Dataset: `sarvamai/gsm8k-indic`, config `hi`, split `test`.
+- Sample: 200 Hindi questions, random seed 42.
+- Fine-tuning: none.
 
-The Hindi question and solution are used for model evaluation. The original-language question/solution are retained as reference metadata and are **not** supplied to the model.
+The runner verifies CUDA availability, native BF16 support, GPU memory, model device, and model parameter dtype before inference begins. If any assertion fails, it stops rather than silently running on CPU or FP16.
 
-## Implemented techniques
+## Techniques
 
-| ID | Technique | Inference calls per question |
-|---|---|---:|
-| E1 | Direct prompting (thinking disabled) | 1 |
-| E2 | Qwen native thinking | 1 |
-| E3 | Explicit Chain-of-Thought | 1 |
-| E4 | Structured CoT | 1 |
-| E5 | English-pivot CoT | 1 |
-| E6 | Plan-and-Solve | 2 |
-| E7 | Self-Consistency (5 samples) | 5 |
-| E8 | Multi-Strategy Parallel Reasoning (4 strategies) | 4 |
-| E9 | MSPR + model-based verifier | 5 |
+| ID | CLI key | Technique |
+|---|---|---|
+| E1 | `question_only` | Hindi question as the entire user prompt; Qwen thinking mode on |
+| E2 | `direct` | Explicit direct-answer instruction; thinking mode off |
+| E3 | `native` | Minimal Hindi instruction with native Qwen thinking |
+| E4 | `cot` | Explicit Chain-of-Thought |
+| E5 | `structured` | Structured mathematical reasoning |
+| E6 | `english_pivot` | Reason in English, answer in Hindi |
+| E7 | `plan_solve` | Plan first, then solve |
+| E8 | `self_consistency` | Five independent CoT candidates + majority voting |
+| E9 | `mspr` | Four different mathematical approaches + majority voting |
+| E10 | `mspr_verifier` | MSPR + a separate self-verifier call |
+| E11 | `answer_trigger` | Exact Hindi question prompt; generate thought to `</think>`, then continue after Qwen's answer boundary |
 
-All techniques use the same unmodified Qwen3-1.7B checkpoint. No fine-tuning is performed.
+### About the answer trigger
 
-## Qwen thinking parser
+Qwen3's documented message format uses `<think> ... </think>` for reasoning, then a blank-line boundary (`\n\n`) and the normal assistant answer. There is not a separate official `<answer>` special token. E11 implements a staged version of that format:
 
-Official Qwen3 uses `<think> ... </think>`. Depending on the chat template, the opening marker may be part of the prompt, so generated output may contain the thinking text followed by `</think>` without a generated `<think>` prefix. The parser handles this form and also accepts `</thinking>` for compatibility with alternate wrappers. Both raw generation and the extracted thinking text are saved.
+1. Generate the thinking phase until the `</think>` token is emitted (or the configured thinking budget is reached).
+2. If the model reaches the token limit without closing its thought, append a closing `</think>` marker and record this intervention.
+3. Append the Qwen answer boundary (`\n\n`) and resume generation for the final answer.
+
+The CSV records the trigger text, whether a closing marker had to be injected, the stop reason, thinking-generation time, and answer-generation time. E1 and E11 use the same user prompt content—the Hindi question only—so they provide a direct comparison between ordinary one-pass generation and staged answer triggering.
 
 ## Install
 
-Create and activate a virtual environment, then install a PyTorch build appropriate to your hardware. Then:
+Install a CUDA-enabled PyTorch build compatible with your NVIDIA driver first. Then:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Step 1: Prepare a fixed 200-question sample
+## Step 1: Prepare the fixed 200-question Sarvam Hindi GSM8K sample
 
 ```bash
 python prepare_dataset.py
 ```
 
-This creates:
+Creates `data/gsm8k_hi_200.csv`. The complete Hindi question is stored in `question_hi`; Hindi and original reference solutions are retained. The source question IDs and the random seed are preserved.
 
-```text
-data/gsm8k_hi_200.csv
-```
+## Step 2: Check the GPU and run a smoke test
 
-Review this file. It contains the complete Hindi question, the Hindi reference solution, the original question/solution, and the extracted gold answer.
-
-## Step 2: Run a small smoke test
-
-Run one question and two techniques first to confirm model loading, generation, and CSV output:
+First check the available CLI options:
 
 ```bash
-python run_experiments.py --max-questions 1 --techniques direct,native
+python run_experiments.py --help
 ```
 
-Then run all nine techniques on the first few questions:
+Then run only the question-only and staged-answer-trigger methods on one item:
+
+```bash
+python run_experiments.py --max-questions 1 --techniques question_only,answer_trigger
+```
+
+The runner prints the selected GPU, total/free VRAM, loaded model device and dtype. It stops if CUDA or BF16 is unavailable, if the GPU is not 16-GB-class, or if free VRAM is below 9 GiB.
+
+Run a three-question smoke test for all techniques:
 
 ```bash
 python run_experiments.py --max-questions 3
@@ -77,72 +84,46 @@ python run_experiments.py --max-questions 3
 python run_experiments.py
 ```
 
-To run selected techniques:
+Optional parameters:
 
 ```bash
-python run_experiments.py --techniques cot,structured,self_consistency,mspr,mspr_verifier
+python run_experiments.py --gpu-id 0 --max-new-tokens 2048 --answer-max-new-tokens 512
 ```
 
-To continue an interrupted run without duplicating completed question/technique pairs:
-
-```bash
-python run_experiments.py --resume
-```
-
-Use `--max-new-tokens` to adjust the generation limit. The default is 2,048 generated tokens per model call.
+If GPU applications use memory, close them before starting. The minimum free-memory guard can be adjusted deliberately with `--min-free-vram-gib`, but do not lower it unless you have checked the available memory.
 
 ## Output files
 
-- `results/qwen3_1_7b_gsm8k_hi_results.csv`: one row per question per technique.
-- `results/summary_by_technique.csv`: aggregated accuracy, timing, token use and numeral-style counts.
+- `results/qwen3_4b_bf16_gsm8k_hi_results.csv`: one row per question per technique.
+- `results/qwen3_4b_bf16_summary_by_technique.csv`: accuracy, timing, token and numeral-format summaries.
 
-Important detailed CSV columns:
+Important detailed CSV fields:
 
-- `question_hi`: full Hindi question.
-- `raw_model_output`: exact decoded generation including Qwen special markers.
-- `thinking_text`: extracted thinking section(s); multiple candidate outputs are stored as JSON arrays.
-- `final_response`: final answer section(s).
-- `extracted_answer_raw`: answer span before numeral conversion.
+- `question_hi`: the full original Hindi question.
+- `prompt_text`: exactly what was passed as user content. For `question_only` and `answer_trigger`, it is only the Hindi question text.
+- `raw_model_output`: full decoded generation, including Qwen markers where present.
+- `thinking_text`: extracted model-generated thinking content.
+- `final_response`: extracted final answer content.
 - `predicted_numeral_system`: `Hindu-Arabic`, `Devanagari`, `Mixed`, `Hindi-word-based`, `Other-text`, or `Unparsed`.
-- `predicted_answer_normalized`: normalized numeric answer used for exact matching.
-- `gold_answer_raw` / `gold_answer_normalized`: reference answer in raw/canonical form.
-- `is_correct`: numeric exact-match result after normalization.
-- `candidate_details_json`: all candidate outputs and their extracted answers for multi-path methods.
-- `latency_seconds` / `model_generation_time_seconds`: total model-generation time for this question and technique, summed across every candidate and optional verifier call.
-- `candidate_generation_time_seconds`: generation time for candidate solutions only.
-- `verifier_generation_time_seconds`: generation time for the verifier call, if used.
-- `technique_inference_time_seconds`: complete end-to-end time for the technique on this question, including all calls, orchestration, voting/selection, verification, answer extraction and result assembly.
+- `extracted_answer_raw`: answer as generated, before numeral normalization.
+- `predicted_answer_normalized`: canonical form used for answer matching.
+- `model_dtype`, `device`, `gpu_name`, `gpu_total_memory_gib`: record the actual execution configuration.
+- `answer_trigger_text`, `answer_trigger_injected`, `thinking_stop_reason`: staged answer-trigger metadata.
+- `thinking_generation_time_seconds`, `answer_generation_time_seconds`: timing breakdown for E11.
+- `technique_inference_time_seconds`: complete per-question duration for the technique, including all generation calls and aggregation. Model loading, dataset loading and CSV writes are excluded.
+- `total_technique_inference_time_seconds`: accumulated end-to-end technique time across the questions in the summary.
 
-The normalizer converts Devanagari digits (०१२३४५६७८९) into ASCII digits (0123456789) before numerical comparison. It does not silently convert percentages into plain numbers or strip units from the stored answer text.
+The numeral normalizer converts Devanagari digits (०१२३४५६७८९) to ASCII digits (0123456789) for correctness checking, while preserving the original answer and detected numeral system in separate columns.
 
-### Timing interpretation
+## Reproducibility
 
-The detailed CSV records complete per-question timing in `technique_inference_time_seconds`. For multi-call methods such as Plan-and-Solve, Self-Consistency, MSPR and MSPR + Verifier, this is the elapsed time for the entire technique—not just the final generation call. The summary CSV reports:
+- Dataset sample seed: 42
+- Inference seed: 2026
+- Model: `Qwen/Qwen3-4B`
+- Precision: BF16
+- Thinking mode temperature / top-p / top-k: 0.6 / 0.95 / 20
+- Non-thinking mode temperature / top-p / top-k: 0.7 / 0.8 / 20
+- Thinking token limit: 2048
+- Staged final-answer token limit: 512
 
-- `total_technique_inference_time_seconds`: sum of the per-question end-to-end technique times across the questions that ran.
-- `avg_technique_inference_time_seconds`: average end-to-end time per question.
-- `median_technique_inference_time_seconds` and `max_technique_inference_time_seconds`: distribution of per-question time.
-- `total_model_generation_time_seconds`: sum of model generation durations across candidate and verifier calls.
-- `total_candidate_generation_time_seconds` and `total_verifier_generation_time_seconds`: timing breakdown.
-
-The technique total excludes model loading, dataset loading, and CSV file writes. It is the accumulated time spent executing that technique across its questions, rather than the overall wall-clock duration of the entire mixed-technique run.
-
-## Notes on interpretation
-
-1. `thinking_text` is the model-generated reasoning text, not a guarantee that it faithfully represents internal model computation.
-2. The same model acts as the verifier in E9; this is self-verification, not an independently trained verifier.
-3. Self-Consistency and MSPR use more model calls than single-path baselines. Compare both raw accuracy and token/latency cost.
-4. The verifier can select a candidate only if it emits a parseable `best_candidate_id`; otherwise the code falls back to majority voting.
-5. The script records the model's numeral style before normalizing the number, so the CSV can be used to study numeral-format preference separately from correctness.
-6. The original English fields are kept in the CSV but are not included in prompts, including the English-pivot condition. The model must interpret the Hindi question itself.
-
-## Suggested reproducibility settings
-
-- Sample seed: 42
-- Run seed: 2026
-- Model: `Qwen/Qwen3-1.7B`
-- Thinking mode temperature/top-p/top-k: 0.6 / 0.95 / 20
-- Non-thinking temperature/top-p/top-k: 0.7 / 0.8 / 20
-- Max new tokens: 2,048
-
-For the Qwen3 thinking-mode settings and marker format, see the official model card: https://huggingface.co/Qwen/Qwen3-1.7B
+See the official [Qwen3-4B model card](https://huggingface.co/Qwen/Qwen3-4B) and [Qwen3 thinking format documentation](https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/concepts.md).
