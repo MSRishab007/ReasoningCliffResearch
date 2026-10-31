@@ -1,0 +1,10 @@
+# Recommended: Python 3.10 or 3.11
+# Install a PyTorch build matching your CUDA/CPU setup first if needed.
+torch>=2.2.0
+transformers>=4.51.0
+accelerate>=0.34.0
+datasets>=3.0.0
+pandas>=2.0.0
+numpy>=1.26.0
+sentencepiece>=0.2.0
+safetensors>=0.4.0
