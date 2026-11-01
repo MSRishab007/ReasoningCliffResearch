@@ -1,9 +1,9 @@
-"""Run inference-time reasoning experiments with Qwen3-4B in BF16 on GPU.
+"""Run inference-time reasoning experiments with Qwen3-4B 4-bit NF4 weights and BF16 compute on GPU.
 
 Experiments include question-only prompting, direct prompting, native Qwen
 thinking, explicit CoT, structured CoT, English-pivot CoT, Plan-and-Solve,
-Self-Consistency, Multi-Strategy Parallel Reasoning (MSPR), MSPR + verifier,
-and a staged Qwen answer-trigger experiment.
+Self-Consistency, Multi-Strategy Parallel Reasoning (MSPR), MSPR + verifier, a natural Qwen answer-trigger experiment,
+and a separate forced-closure control.
 
 GPU is mandatory: this runner deliberately refuses CPU execution or automatic
 CPU offload. The full Hindi question, model thinking, final response, raw
@@ -34,9 +34,9 @@ import torch
 
 MODEL_ID_DEFAULT = "Qwen/Qwen3-4B"
 DEFAULT_INPUT = "data/gsm8k_hi_200.csv"
-DEFAULT_RESULTS = "results/qwen3_4b_bf16_gsm8k_hi_results.csv"
-DEFAULT_SUMMARY = "results/qwen3_4b_bf16_summary_by_technique.csv"
-DEFAULT_DTYPE_NAME = "bfloat16"
+DEFAULT_RESULTS = "results/qwen3_4b_nf4_bf16_gsm8k_hi_results_v2.csv"
+DEFAULT_SUMMARY = "results/qwen3_4b_nf4_bf16_summary_by_technique_v2.csv"
+DEFAULT_DTYPE_NAME = "4-bit NF4 weights / BF16 compute"
 
 DEVANAGARI_DIGITS = "०१२३४५६७८९"
 ASCII_DIGITS = "0123456789"
@@ -50,13 +50,16 @@ CSV_FIELDS = [
     "question_hi", "question_original", "reference_solution_hi",
     "reference_solution_original", "gold_answer_raw", "gold_answer_source",
     "gold_answer_normalized", "gold_numeral_system", "model", "model_dtype",
-    "device", "gpu_name", "gpu_total_memory_gib", "technique_id", "technique_name",
+    "device", "gpu_name", "gpu_total_memory_gib", "gpu_compute_capability",
+    "weight_quantization", "quantization_type", "compute_dtype", "bnb_double_quant",
+    "technique_id", "technique_name",
     "thinking_enabled", "temperature", "top_p", "top_k", "max_new_tokens",
     "answer_max_new_tokens", "num_candidates", "prompt_text", "raw_model_output",
     "thinking_text", "final_response", "candidate_details_json", "verifier_raw_output",
     "verifier_thinking_text", "answer_trigger_text", "answer_trigger_injected",
-    "thinking_stop_reason", "thinking_generation_time_seconds",
-    "answer_generation_time_seconds", "extracted_answer_raw", "predicted_numeral_system",
+    "thinking_stop_reason", "answer_generation_status", "thinking_timing_scope",
+    "thinking_generation_time_seconds", "answer_generation_time_seconds",
+    "extracted_answer_raw", "predicted_numeral_system",
     "predicted_answer_normalized", "is_correct", "answer_extraction_status",
     "input_tokens", "output_tokens", "thinking_tokens", "final_tokens",
     "latency_seconds", "model_generation_time_seconds",
@@ -78,11 +81,42 @@ class Generation:
     temperature: float
     top_p: float
     top_k: int
-    thinking_generation_time_seconds: float = 0.0
-    answer_generation_time_seconds: float = 0.0
+    thinking_generation_time_seconds: Optional[float] = 0.0
+    answer_generation_time_seconds: Optional[float] = 0.0
     answer_trigger_text: str = ""
     answer_trigger_injected: bool = False
     thinking_stop_reason: str = "not_applicable"
+    answer_generation_status: str = "not_applicable"
+    thinking_timing_scope: str = "not_applicable"
+
+
+def classify_thinking_stop(
+    generated_token_ids: list[int],
+    max_new_tokens: int,
+    think_end_token_id: int,
+    eos_token_id: Optional[int],
+) -> str:
+    """Classify how the model's thinking phase ended without guessing."""
+    if generated_token_ids and generated_token_ids[-1] == think_end_token_id:
+        return "natural_think_end"
+    if generated_token_ids and eos_token_id is not None and generated_token_ids[-1] == eos_token_id:
+        return "eos_before_think_end"
+    if len(generated_token_ids) >= max_new_tokens:
+        return "max_new_tokens_without_think_end"
+    return "generation_ended_without_think_end"
+
+
+def resolve_answer_trigger_action(stop_reason: str, force_close_on_limit: bool) -> tuple[bool, bool]:
+    """Return (run_answer_phase, inject_think_end).
+
+    Natural E11 only continues after a naturally generated </think>. The E12
+    control may inject </think> only when the thinking token budget is exhausted.
+    """
+    if stop_reason == "natural_think_end":
+        return True, False
+    if force_close_on_limit and stop_reason == "max_new_tokens_without_think_end":
+        return True, True
+    return False, False
 
 
 class QwenRunner:
@@ -92,18 +126,22 @@ class QwenRunner:
         max_new_tokens: int,
         answer_max_new_tokens: int = 512,
         gpu_id: int = 0,
-        min_free_vram_gib: float = 9.0,
+        min_free_vram_gib: float = 4.0,
     ) -> None:
         self.model_id = model_id
         self.max_new_tokens = max_new_tokens
         self.answer_max_new_tokens = answer_max_new_tokens
         self.gpu_id = gpu_id
+        self.weight_quantization = "4-bit"
+        self.quantization_type = "NF4"
+        self.compute_dtype_name = "bfloat16"
+        self.bnb_double_quant = True
 
-        # Mandatory GPU + native BF16 checks. Never silently fall back to CPU.
+        # GPU-only execution. No CPU fallback or offload is permitted. We quantize weights to NF4 4-bit and use BF16 for compute.
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "CUDA GPU is required, but torch.cuda.is_available() is False. "
-                "Install a CUDA-enabled PyTorch build and check the NVIDIA driver."
+                "Install a CUDA-enabled PyTorch wheel and verify the NVIDIA driver."
             )
         if gpu_id < 0 or gpu_id >= torch.cuda.device_count():
             raise RuntimeError(
@@ -115,60 +153,129 @@ class QwenRunner:
             capability = torch.cuda.get_device_capability(gpu_id)
             raise RuntimeError(
                 f"GPU '{name}' (compute capability {capability}) does not report native BF16 support. "
-                "This run is configured for BF16 only; CPU/FP16 fallback is disabled."
+                "This run requires 4-bit NF4 weights with BF16 compute; no FP16/CPU fallback is enabled."
             )
 
         props = torch.cuda.get_device_properties(gpu_id)
         total_gib = props.total_memory / (1024 ** 3)
-        free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
+        free_bytes, _ = torch.cuda.mem_get_info(gpu_id)
         free_gib = free_bytes / (1024 ** 3)
+        capability = torch.cuda.get_device_capability(gpu_id)
+        self.gpu_name = props.name
+        self.gpu_total_memory_gib = round(total_gib, 3)
+        self.gpu_compute_capability = f"{capability[0]}.{capability[1]}"
+
         print(f"GPU selected: cuda:{gpu_id} | {props.name}")
+        print(f"Compute capability: {self.gpu_compute_capability} | BF16 supported")
         print(f"GPU memory: {free_gib:.2f} GiB free / {total_gib:.2f} GiB total")
-        if total_gib < 14.0:
+        if total_gib < 5.5:
             raise RuntimeError(
-                f"The selected GPU has {total_gib:.2f} GiB total memory. "
-                "This experiment expects a 16-GB-class GPU for Qwen3-4B BF16."
+                f"GPU has only {total_gib:.2f} GiB total memory. Qwen3-4B NF4 requires a 6-GB-class GPU."
             )
         if free_gib < min_free_vram_gib:
             raise RuntimeError(
                 f"Only {free_gib:.2f} GiB VRAM is free; at least {min_free_vram_gib:.2f} GiB is required. "
-                "Close GPU-heavy applications or lower the configured minimum deliberately."
+                "Close GPU-heavy applications before loading the quantized model."
             )
 
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import bitsandbytes as bnb
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         except ImportError as exc:
             raise ImportError(
-                "transformers is not installed. Run `pip install -r requirements.txt`."
+                "4-bit loading requires bitsandbytes and Transformers. Install with "
+                '`python -m pip install --upgrade "bitsandbytes>=0.50.2" "transformers>=4.51" accelerate`.'
             ) from exc
+
+        # Fail early with a useful message if the installed bitsandbytes wheel
+        # cannot initialize its CUDA backend on this Windows/Python environment.
+        try:
+            bnb_version = getattr(bnb, "__version__", "unknown")
+            print(f"bitsandbytes version: {bnb_version}")
+            from bitsandbytes.nn import Linear4bit  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "bitsandbytes could not initialize its 4-bit CUDA components. "
+                "Upgrade bitsandbytes and verify the CUDA-enabled PyTorch installation."
+            ) from exc
+
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
 
         print(f"Loading tokenizer: {model_id}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-        print(f"Loading model in BF16 directly onto cuda:{gpu_id}: {model_id}")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            device_map={"": gpu_id},
-            low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
+        print(
+            f"Loading {model_id} with 4-bit NF4 weights and BF16 compute "
+            f"directly on cuda:{gpu_id}; CPU offload is disabled."
         )
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch.bfloat16,
+                quantization_config=quantization_config,
+                device_map={"": gpu_id},
+                low_cpu_mem_usage=True,
+                attn_implementation="sdpa",
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            torch.cuda.empty_cache()
+            raise RuntimeError(
+                "CUDA ran out of VRAM while loading Qwen3-4B NF4. Close other GPU applications, "
+                "reduce the free-memory pressure, or lower the generation token limit. "
+                "This runner does not offload model layers to CPU."
+            ) from exc
+
         self.model.eval()
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Verify the quantized model really contains bitsandbytes 4-bit layers.
+        linear4bit_count = sum(
+            1 for module in self.model.modules() if module.__class__.__name__ == "Linear4bit"
+        )
+        if linear4bit_count == 0:
+            raise RuntimeError(
+                "No bitsandbytes Linear4bit layers were found. The model did not load in 4-bit as requested."
+            )
+
         first_parameter = next(self.model.parameters())
         if first_parameter.device.type != "cuda":
             raise RuntimeError(
-                f"GPU-only assertion failed: model parameter landed on {first_parameter.device}."
+                f"GPU-only assertion failed: first model parameter landed on {first_parameter.device}."
             )
-        if first_parameter.dtype != torch.bfloat16:
+
+        # Confirm Accelerate did not place any module on CPU or disk.
+        device_map = getattr(self.model, "hf_device_map", {}) or {}
+        offloaded = {
+            name: device for name, device in device_map.items()
+            if str(device).lower() in {"cpu", "disk"}
+        }
+        if offloaded:
+            raise RuntimeError(f"CPU/disk offload detected, but this experiment is GPU-only: {offloaded}")
+
+        # Confirm each quantized projection uses BF16 for matrix multiplication.
+        bad_compute_modules = []
+        for name, module in self.model.named_modules():
+            if module.__class__.__name__ == "Linear4bit":
+                compute_dtype = getattr(module, "compute_dtype", None)
+                if compute_dtype != torch.bfloat16:
+                    bad_compute_modules.append((name, str(compute_dtype)))
+        if bad_compute_modules:
             raise RuntimeError(
-                f"BF16 assertion failed: model parameter dtype is {first_parameter.dtype}, not torch.bfloat16."
+                "Some 4-bit linear layers are not configured for BF16 compute: "
+                f"{bad_compute_modules[:5]}"
             )
+
         self.device = torch.device(f"cuda:{gpu_id}")
-        self.gpu_name = props.name
-        self.gpu_total_memory_gib = round(total_gib, 3)
-        print(f"Verified: model device={first_parameter.device}, dtype={first_parameter.dtype}")
+        self.linear4bit_count = linear4bit_count
+        print(
+            "Verified: GPU-only model load; "
+            f"{linear4bit_count} Linear4bit layers; NF4 weights; BF16 compute."
+        )
         print(f"Allocated VRAM after load: {torch.cuda.memory_allocated(gpu_id) / (1024 ** 3):.2f} GiB")
 
         think_ids = self.tokenizer.encode("</think>", add_special_tokens=False)
@@ -223,6 +330,28 @@ class QwenRunner:
             "use_cache": True,
         }
 
+    @staticmethod
+    def _extract_sequences(generate_output: Any) -> torch.Tensor:
+        """Support both Transformers generate() return formats.
+
+        By default, generate() returns a Tensor. When
+        return_dict_in_generate=True, it returns a ModelOutput exposing
+        `.sequences`. Older runner code assumed the latter unconditionally,
+        which caused: AttributeError: 'Tensor' object has no attribute 'sequences'.
+        """
+        sequences = getattr(generate_output, "sequences", generate_output)
+        if not isinstance(sequences, torch.Tensor):
+            raise TypeError(
+                "model.generate() must return a Tensor or an object with a Tensor "
+                f"'.sequences' attribute; got {type(generate_output).__name__}."
+            )
+        if sequences.ndim != 2:
+            raise ValueError(
+                "Expected generated token IDs with shape [batch, sequence], "
+                f"but received shape {tuple(sequences.shape)}."
+            )
+        return sequences
+
     def _timed_generate(
         self,
         *,
@@ -243,7 +372,9 @@ class QwenRunner:
                 **sample_kwargs,
             )
         torch.cuda.synchronize(self.gpu_id)
-        return output.sequences, time.perf_counter() - start
+        elapsed = time.perf_counter() - start
+        sequences = self._extract_sequences(output)
+        return sequences, elapsed
 
     def generate(
         self,
@@ -255,10 +386,11 @@ class QwenRunner:
         kwargs = self._sample_kwargs(enable_thinking, seed)
         inputs = self._format_inputs(prompt, enable_thinking)
         input_tokens = int(inputs["input_ids"].shape[-1])
+        token_limit = max_new_tokens or self.max_new_tokens
         sequences, elapsed = self._timed_generate(
             input_ids=inputs["input_ids"],
             attention_mask=inputs.get("attention_mask", torch.ones_like(inputs["input_ids"])),
-            max_new_tokens=max_new_tokens or self.max_new_tokens,
+            max_new_tokens=token_limit,
             sample_kwargs=kwargs,
         )
         generated_ids = sequences[0, input_tokens:]
@@ -269,23 +401,55 @@ class QwenRunner:
         output_tokens = int(generated_ids.numel())
         thinking_tokens = len(self.tokenizer.encode(thinking, add_special_tokens=False)) if thinking else 0
         final_tokens = len(self.tokenizer.encode(final, add_special_tokens=False)) if final else 0
+
+        has_think_close = bool(re.search(r"</(?:think|thinking)>", raw, flags=re.IGNORECASE))
+        if enable_thinking:
+            if has_think_close:
+                stop_reason = "think_end_present_in_full_generation"
+            elif output_tokens >= token_limit:
+                stop_reason = "max_new_tokens_without_think_end"
+            else:
+                stop_reason = "generation_ended_without_think_end"
+            # A standard one-call Qwen generation does not expose a clean timing
+            # boundary between </think> and the answer. For an incomplete trace,
+            # this call is pure thinking; for a completed trace, this is the
+            # combined reasoning+answer call. The scope column makes that clear.
+            thinking_time = elapsed if not final else None
+            timing_scope = (
+                "single_call_thinking_only_no_answer"
+                if not final else "single_call_combined_phases_not_separable"
+            )
+            answer_time = None
+            answer_status = "no_final_answer_in_generation" if not final else "generated_in_same_call"
+        else:
+            stop_reason = "thinking_disabled"
+            thinking_time = 0.0
+            timing_scope = "single_call_answer_only"
+            answer_time = elapsed
+            answer_status = "generated_in_same_call" if final else "no_final_answer_in_generation"
+
         return Generation(
             raw=raw, thinking=thinking, final=final,
             input_tokens=input_tokens, output_tokens=output_tokens,
             thinking_tokens=thinking_tokens, final_tokens=final_tokens,
             latency_seconds=elapsed, temperature=kwargs["temperature"],
             top_p=kwargs["top_p"], top_k=kwargs["top_k"],
+            thinking_generation_time_seconds=thinking_time,
+            answer_generation_time_seconds=answer_time,
+            thinking_stop_reason=stop_reason,
+            answer_generation_status=answer_status,
+            thinking_timing_scope=timing_scope,
         )
 
-    def generate_with_answer_trigger(self, prompt: str, seed: int) -> Generation:
-        """Generate thinking to </think>, then continue after the Qwen answer delimiter.
+    def generate_with_answer_trigger(
+        self, prompt: str, seed: int, force_close_on_limit: bool = False
+    ) -> Generation:
+        """Generate thinking up to Qwen's </think>, then optionally generate its answer.
 
-        Qwen3 does not define a separate <answer> special token. Its documented
-        format closes reasoning with </think>, followed by a blank-line boundary
-        and then the assistant's normal answer. We stop at </think> and resume
-        generation after the `\n\n` answer boundary. If the thought budget is
-        exhausted before the model emits </think>, we inject the closing marker
-        and record that intervention in the CSV.
+        Natural mode (E11) only starts the answer phase if the model itself emits
+        </think>. If the thought budget expires first, it records truncation and
+        returns without inventing a closing token. Forced mode (E12) is a separate
+        control: after max_new_tokens it explicitly appends </think> and continues.
         """
         kwargs = self._sample_kwargs(True, seed)
         inputs = self._format_inputs(prompt, enable_thinking=True)
@@ -293,7 +457,6 @@ class QwenRunner:
         base_mask = inputs.get("attention_mask", torch.ones_like(base_ids))
         input_tokens = int(base_ids.shape[-1])
 
-        # Stop the reasoning phase as soon as Qwen emits its </think> token.
         phase1_sequences, phase1_time = self._timed_generate(
             input_ids=base_ids,
             attention_mask=base_mask,
@@ -305,22 +468,57 @@ class QwenRunner:
         phase1_raw = self.tokenizer.decode(
             phase1_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
         )
-        closed_naturally = bool(phase1_ids.numel()) and int(phase1_ids[-1]) == self.think_end_token_id
-        stop_reason = "think_end_token" if closed_naturally else "max_new_tokens_forced_close"
+        phase1_token_list = [int(x) for x in phase1_ids.tolist()]
+        stop_reason = classify_thinking_stop(
+            phase1_token_list,
+            self.max_new_tokens,
+            self.think_end_token_id,
+            self.tokenizer.eos_token_id,
+        )
+        run_answer_phase, inject_close = resolve_answer_trigger_action(
+            stop_reason, force_close_on_limit=force_close_on_limit
+        )
 
-        # Explicit Qwen answer transition: closing tag + blank-line separator.
-        trigger_text = "\n\n"
-        if closed_naturally:
-            continuation_prefix = phase1_ids
-        else:
-            close_tensor = torch.tensor([[self.think_end_token_id]], dtype=base_ids.dtype, device=self.device)
+        thinking, _ = self._split_thinking(phase1_raw)
+        if not thinking:
+            # Preserve incomplete thinking even if a model output omits its opening tag.
+            thinking = re.sub(r"</(?:think|thinking)>\s*$", "", phase1_raw, flags=re.I).strip()
+        thinking_tokens = len(self.tokenizer.encode(thinking, add_special_tokens=False)) if thinking else 0
+
+        # Natural E11 truncation: do not fabricate </think> and do not run answer phase.
+        if not run_answer_phase:
+            total_output_tokens = int(phase1_ids.numel())
+            return Generation(
+                raw=phase1_raw, thinking=thinking, final="",
+                input_tokens=input_tokens, output_tokens=total_output_tokens,
+                thinking_tokens=thinking_tokens, final_tokens=0,
+                latency_seconds=phase1_time,
+                temperature=kwargs["temperature"], top_p=kwargs["top_p"], top_k=kwargs["top_k"],
+                thinking_generation_time_seconds=phase1_time,
+                answer_generation_time_seconds=0.0,
+                answer_trigger_text="",
+                answer_trigger_injected=False,
+                thinking_stop_reason=stop_reason,
+                answer_generation_status="skipped_thinking_truncated" if stop_reason == "max_new_tokens_without_think_end" else "skipped_no_natural_think_end",
+                thinking_timing_scope="isolated_thinking_phase",
+            )
+
+        # If E12 needs to force closure, inject the actual Qwen special token.
+        if inject_close:
+            close_tensor = torch.tensor(
+                [[self.think_end_token_id]], dtype=base_ids.dtype, device=self.device
+            )
             continuation_prefix = torch.cat([phase1_ids.unsqueeze(0), close_tensor], dim=1)
-        trigger_ids = self.tokenizer.encode(trigger_text, add_special_tokens=False)
-        trigger_tensor = torch.tensor([trigger_ids], dtype=base_ids.dtype, device=self.device)
-        phase2_input = torch.cat([base_ids, continuation_prefix, trigger_tensor], dim=1)
+            transition_text = "</think>\n\n"
+        else:
+            continuation_prefix = phase1_ids.unsqueeze(0)
+            transition_text = "\n\n"
+
+        separator_ids = self.tokenizer.encode("\n\n", add_special_tokens=False)
+        separator_tensor = torch.tensor([separator_ids], dtype=base_ids.dtype, device=self.device)
+        phase2_input = torch.cat([base_ids, continuation_prefix, separator_tensor], dim=1)
         phase2_mask = torch.ones_like(phase2_input)
 
-        # Reset seed to keep the answer-stage sampling reproducible but distinct.
         kwargs_phase2 = self._sample_kwargs(True, seed + 1)
         phase2_sequences, phase2_time = self._timed_generate(
             input_ids=phase2_input,
@@ -333,14 +531,10 @@ class QwenRunner:
             phase2_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
         )
         _, final = self._split_thinking(phase2_raw)
-        thinking, _ = self._split_thinking(phase1_raw)
-        if not thinking:
-            # Preserve incomplete thinking even if the model omitted its opening tag.
-            thinking = re.sub(r"</think>\s*$", "", phase1_raw).strip()
 
-        raw = phase1_raw + "\n\n" + phase2_raw
-        total_output_tokens = int(phase1_ids.numel() + phase2_ids.numel())
-        thinking_tokens = len(self.tokenizer.encode(thinking, add_special_tokens=False)) if thinking else 0
+        raw_transition = "</think>\n\n" if inject_close else "\n\n"
+        raw = phase1_raw + raw_transition + phase2_raw
+        total_output_tokens = int(phase1_ids.numel() + phase2_ids.numel() + (1 if inject_close else 0))
         final_tokens = len(self.tokenizer.encode(final, add_special_tokens=False)) if final else 0
         return Generation(
             raw=raw, thinking=thinking, final=final,
@@ -351,9 +545,11 @@ class QwenRunner:
             temperature=kwargs["temperature"], top_p=kwargs["top_p"], top_k=kwargs["top_k"],
             thinking_generation_time_seconds=phase1_time,
             answer_generation_time_seconds=phase2_time,
-            answer_trigger_text="</think>\n\n",
-            answer_trigger_injected=not closed_naturally,
-            thinking_stop_reason=stop_reason,
+            answer_trigger_text=transition_text,
+            answer_trigger_injected=inject_close,
+            thinking_stop_reason="max_new_tokens_forced_close" if inject_close else "natural_think_end",
+            answer_generation_status="generated_after_forced_think_close" if inject_close else "generated_after_natural_think_end",
+            thinking_timing_scope="isolated_thinking_phase",
         )
 
 def normalize_digits(text: str) -> str:
@@ -477,7 +673,8 @@ TECHNIQUES = {
     "self_consistency": "E8_Self_Consistency_N5",
     "mspr": "E9_MSPR_Majority",
     "mspr_verifier": "E10_MSPR_Verifier",
-    "answer_trigger": "E11_Question_Only_Staged_Answer_Trigger",
+    "answer_trigger": "E11_Question_Only_Natural_Answer_Trigger",
+    "answer_trigger_forced": "E12_Question_Only_Forced_Thinking_Closure_Control",
 }
 
 
@@ -546,6 +743,8 @@ def run_single(runner: QwenRunner, prompt: str, thinking: bool, seed: int) -> di
         "answer_trigger_text": generation.answer_trigger_text,
         "answer_trigger_injected": generation.answer_trigger_injected,
         "thinking_stop_reason": generation.thinking_stop_reason,
+        "answer_generation_status": generation.answer_generation_status,
+        "thinking_timing_scope": generation.thinking_timing_scope,
         "temperature": generation.temperature,
         "top_p": generation.top_p,
         "top_k": generation.top_k,
@@ -553,8 +752,10 @@ def run_single(runner: QwenRunner, prompt: str, thinking: bool, seed: int) -> di
     }
 
 
-def run_answer_triggered(runner: QwenRunner, prompt: str, seed: int) -> dict[str, Any]:
-    generation = runner.generate_with_answer_trigger(prompt, seed)
+def run_answer_triggered(
+    runner: QwenRunner, prompt: str, seed: int, force_close_on_limit: bool = False
+) -> dict[str, Any]:
+    generation = runner.generate_with_answer_trigger(prompt, seed, force_close_on_limit=force_close_on_limit)
     answer_raw, numeral_style, answer_normalized = extract_answer(generation.final)
     return {
         "raw": generation.raw,
@@ -573,6 +774,8 @@ def run_answer_triggered(runner: QwenRunner, prompt: str, seed: int) -> dict[str
         "answer_trigger_text": generation.answer_trigger_text,
         "answer_trigger_injected": generation.answer_trigger_injected,
         "thinking_stop_reason": generation.thinking_stop_reason,
+        "answer_generation_status": generation.answer_generation_status,
+        "thinking_timing_scope": generation.thinking_timing_scope,
         "temperature": generation.temperature,
         "top_p": generation.top_p,
         "top_k": generation.top_k,
@@ -596,6 +799,8 @@ def candidate_details(candidates: list[dict[str, Any]]) -> str:
             "answer_trigger_text": candidate.get("answer_trigger_text", ""),
             "answer_trigger_injected": candidate.get("answer_trigger_injected", False),
             "thinking_stop_reason": candidate.get("thinking_stop_reason", "not_applicable"),
+            "answer_generation_status": candidate.get("answer_generation_status", "not_applicable"),
+            "thinking_timing_scope": candidate.get("thinking_timing_scope", "not_applicable"),
         })
     return json.dumps(safe, ensure_ascii=False)
 
@@ -700,11 +905,19 @@ def aggregate_generation_stats(generations: list[dict[str, Any]]) -> dict[str, A
         "thinking_tokens": sum(g["thinking_tokens"] for g in generations),
         "final_tokens": sum(g["final_tokens"] for g in generations),
         "latency_seconds": sum(g["latency_seconds"] for g in generations),
-        "thinking_generation_time_seconds": sum(g.get("thinking_generation_time_seconds", 0.0) for g in generations),
-        "answer_generation_time_seconds": sum(g.get("answer_generation_time_seconds", 0.0) for g in generations),
+        "thinking_generation_time_seconds": sum(
+            float(g["thinking_generation_time_seconds"]) for g in generations
+            if g.get("thinking_generation_time_seconds") not in (None, "")
+        ) if any(g.get("thinking_generation_time_seconds") not in (None, "") for g in generations) else "",
+        "answer_generation_time_seconds": sum(
+            float(g["answer_generation_time_seconds"]) for g in generations
+            if g.get("answer_generation_time_seconds") not in (None, "")
+        ) if any(g.get("answer_generation_time_seconds") not in (None, "") for g in generations) else "",
         "answer_trigger_text": json.dumps([g.get("answer_trigger_text", "") for g in generations if g.get("answer_trigger_text")], ensure_ascii=False) if any(g.get("answer_trigger_text") for g in generations) else "",
         "answer_trigger_injected": any(g.get("answer_trigger_injected", False) for g in generations),
         "thinking_stop_reason": json.dumps([g.get("thinking_stop_reason", "not_applicable") for g in generations], ensure_ascii=False) if any(g.get("thinking_stop_reason", "not_applicable") != "not_applicable" for g in generations) else "not_applicable",
+        "answer_generation_status": generations[0].get("answer_generation_status", "not_applicable") if len(generations) == 1 else json.dumps([g.get("answer_generation_status", "not_applicable") for g in generations], ensure_ascii=False),
+        "thinking_timing_scope": generations[0].get("thinking_timing_scope", "not_applicable") if len(generations) == 1 else json.dumps([g.get("thinking_timing_scope", "not_applicable") for g in generations], ensure_ascii=False),
     }
 
 
@@ -775,7 +988,12 @@ def make_result_row(
         "gold_answer_normalized": gold_normalized,
         "gold_numeral_system": gold_style,
         "model": model_id,
-        "model_dtype": "bfloat16",
+        "model_dtype": "4-bit NF4 weights / BF16 compute",
+        "weight_quantization": "4-bit",
+        "quantization_type": "NF4",
+        "compute_dtype": "bfloat16",
+        "bnb_double_quant": True,
+        "gpu_compute_capability": "",
         "device": "cuda",
         "gpu_name": "",
         "gpu_total_memory_gib": "",
@@ -798,14 +1016,20 @@ def make_result_row(
         "answer_trigger_text": stats["answer_trigger_text"],
         "answer_trigger_injected": stats["answer_trigger_injected"],
         "thinking_stop_reason": stats["thinking_stop_reason"],
+        "answer_generation_status": stats["answer_generation_status"],
+        "thinking_timing_scope": stats["thinking_timing_scope"],
         "thinking_generation_time_seconds": stats["thinking_generation_time_seconds"],
         "answer_generation_time_seconds": stats["answer_generation_time_seconds"],
         "extracted_answer_raw": predicted_raw,
         "predicted_numeral_system": predicted_style,
         "predicted_answer_normalized": predicted_normalized,
         "is_correct": is_correct,
-        "answer_extraction_status": "parsed_numeric" if predicted_normalized else (
-            "word_based" if predicted_style == "Hindi-word-based" else "unparsed"
+        "answer_extraction_status": (
+            "thinking_truncated_no_answer"
+            if stats["answer_generation_status"] == "skipped_thinking_truncated"
+            else ("parsed_numeric" if predicted_normalized else (
+                "word_based" if predicted_style == "Hindi-word-based" else "unparsed"
+            ))
         ),
         "input_tokens": stats["input_tokens"] + (verifier.get("input_tokens", 0) if verifier else 0),
         "output_tokens": stats["output_tokens"] + (verifier.get("output_tokens", 0) if verifier else 0),
@@ -835,10 +1059,14 @@ def run_technique(
         outputs = [run_single(runner, prompt, True, row_seed)]
         return outputs, outputs[0], True, 1, prompt, verifier
     if technique == "answer_trigger":
-        # Same content as question_only; the only experimental difference is
-        # stopping at </think> and continuing after Qwen's answer boundary.
+        # E11: only continue if Qwen naturally emits </think>.
         prompt = build_prompt("question_only", question)
-        outputs = [run_answer_triggered(runner, prompt, row_seed)]
+        outputs = [run_answer_triggered(runner, prompt, row_seed, force_close_on_limit=False)]
+        return outputs, outputs[0], True, 1, prompt, verifier
+    if technique == "answer_trigger_forced":
+        # E12: separate control that injects </think> only if the token budget expires.
+        prompt = build_prompt("question_only", question)
+        outputs = [run_answer_triggered(runner, prompt, row_seed, force_close_on_limit=True)]
         return outputs, outputs[0], True, 1, prompt, verifier
     if technique == "direct":
         prompt = build_prompt("direct", question)
@@ -931,6 +1159,9 @@ def write_summary(results_path: Path, summary_path: Path) -> None:
         avg_answer_generation_time_seconds=("answer_generation_time_seconds", "mean"),
         total_answer_generation_time_seconds=("answer_generation_time_seconds", "sum"),
         forced_thinking_closures=("answer_trigger_injected", lambda s: int((s.astype(str).str.lower() == "true").sum())),
+        natural_think_completions=("thinking_stop_reason", lambda s: int(s.astype(str).str.contains("natural_think_end", regex=False).sum())),
+        thinking_truncations=("thinking_stop_reason", lambda s: int(s.astype(str).str.contains("max_new_tokens", regex=False).sum())),
+        skipped_answer_phases=("answer_generation_status", lambda s: int(s.astype(str).str.contains("skipped_", regex=False).sum())),
         devanagari_outputs=("predicted_numeral_system", lambda s: int((s == "Devanagari").sum())),
         hindu_arabic_outputs=("predicted_numeral_system", lambda s: int((s == "Hindu-Arabic").sum())),
         mixed_outputs=("predicted_numeral_system", lambda s: int((s == "Mixed").sum())),
@@ -947,14 +1178,14 @@ def main() -> None:
     parser.add_argument("--output", default=DEFAULT_RESULTS)
     parser.add_argument("--summary", default=DEFAULT_SUMMARY)
     parser.add_argument("--model", default=MODEL_ID_DEFAULT)
-    parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum tokens for the thinking/candidate generation phase")
-    parser.add_argument("--answer-max-new-tokens", type=int, default=512, help="Maximum tokens for the staged answer-trigger phase")
+    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum tokens for thinking/candidate generation; if </think> is absent the natural trigger is marked truncated")
+    parser.add_argument("--answer-max-new-tokens", type=int, default=512, help="Maximum tokens for the answer phase after natural or explicitly forced </think>")
     parser.add_argument("--gpu-id", type=int, default=0, help="CUDA GPU index; CPU execution is disabled")
-    parser.add_argument("--min-free-vram-gib", type=float, default=9.0, help="Minimum free VRAM required before loading BF16 model")
+    parser.add_argument("--min-free-vram-gib", type=float, default=4.0, help="Minimum free VRAM required before loading Qwen3-4B 4-bit model")
     parser.add_argument("--max-questions", type=int, default=0, help="0 means all questions; use 1-3 for a smoke test")
     parser.add_argument("--techniques", default="all", help="all or comma-separated IDs: " + ",".join(TECHNIQUES))
     parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--resume", action="store_true", help="Skip question/technique rows already present in output CSV")
+    parser.add_argument("--resume", action="store_true", help="Resume from CSV: skip successful question/technique rows and retry failed rows")
     args = parser.parse_args()
 
     questions = load_questions(args.input)
@@ -969,10 +1200,30 @@ def main() -> None:
     output_path = Path(args.output)
     completed: set[tuple[str, str]] = set()
     if args.resume and output_path.exists():
+        failed_rows = 0
         with output_path.open("r", newline="", encoding="utf-8-sig") as f:
-            for existing in csv.DictReader(f):
-                completed.add((existing.get("question_id", ""), existing.get("technique_id", "")))
-        print(f"Resume enabled: found {len(completed)} completed question/technique rows")
+            reader = csv.DictReader(f)
+            existing_fields = set(reader.fieldnames or [])
+            missing_fields = sorted(set(CSV_FIELDS) - existing_fields)
+            if missing_fields:
+                raise RuntimeError(
+                    "The selected resume CSV uses an older/incompatible schema. "
+                    f"Missing columns: {missing_fields}. Use the default v2 output path "
+                    f"({DEFAULT_RESULTS}) or choose a new --output path; do not append v2 rows to the old pilot CSV."
+                )
+            for existing in reader:
+                key = (existing.get("question_id", ""), existing.get("technique_id", ""))
+                # Only successful rows count as completed. A previous error row
+                # is retried on resume rather than silently skipped.
+                status = (existing.get("run_status") or "").strip().lower()
+                if status in {"ok", "success", "completed"}:
+                    completed.add(key)
+                else:
+                    failed_rows += 1
+        print(
+            f"Resume enabled: {len(completed)} successful question/technique rows "
+            f"will be skipped; {failed_rows} failed/unknown rows will be retried."
+        )
     elif output_path.exists() and not args.resume:
         output_path.unlink()
 
@@ -1018,6 +1269,12 @@ def main() -> None:
                 result["device"] = str(runner.device)
                 result["gpu_name"] = runner.gpu_name
                 result["gpu_total_memory_gib"] = runner.gpu_total_memory_gib
+                result["gpu_compute_capability"] = runner.gpu_compute_capability
+                result["weight_quantization"] = runner.weight_quantization
+                result["quantization_type"] = runner.quantization_type
+                result["compute_dtype"] = runner.compute_dtype_name
+                result["bnb_double_quant"] = runner.bnb_double_quant
+                result["model_dtype"] = "4-bit NF4 weights / BF16 compute"
                 result["max_new_tokens"] = args.max_new_tokens
                 result["answer_max_new_tokens"] = args.answer_max_new_tokens
                 result["technique_inference_time_seconds"] = round(
@@ -1039,7 +1296,12 @@ def main() -> None:
                     "reference_solution_original": source.get("reference_solution_original", ""),
                     "gold_answer_raw": source.get("gold_answer_raw", ""),
                     "model": args.model,
-                    "model_dtype": "bfloat16",
+                    "model_dtype": "4-bit NF4 weights / BF16 compute",
+                    "weight_quantization": "4-bit",
+                    "quantization_type": "NF4",
+                    "compute_dtype": "bfloat16",
+                    "bnb_double_quant": True,
+                    "gpu_compute_capability": getattr(runner, "gpu_compute_capability", ""),
                     "device": str(runner.device),
                     "gpu_name": runner.gpu_name,
                     "gpu_total_memory_gib": runner.gpu_total_memory_gib,
